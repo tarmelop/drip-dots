@@ -140,9 +140,67 @@ function easeInOutCubic(x) {
 
 const COLS = 8;
 let gridKey = '';
+let gridCell = 0;
+
+// ---- Poke & long-press ----
+const HOLD_DELAY = 220;   // ms: shorter than this is a poke, longer starts inflating
+const INFLATE_MS = 1600;  // ms of holding (after HOLD_DELAY) until the dot pops
+const INFLATE_MAX = 1.4;  // extra size at full inflation (1.4 → 2.4× the normal size)
+let presses = new Map();  // pointerId → { b, t } — supports multiple fingers
+let splashes = [];
+
+function bubbleAt(px, py) {
+	let best = null, bestD = Infinity;
+	for (let b of bubbles) {
+		if (b.popped) continue;
+		let d = dist(px, py, b.x, b.y);
+		if (d < bestD) { best = b; bestD = d; }
+	}
+	return bestD < gridCell * 0.55 ? best : null; // generous hit area for fingers
+}
+
+function setupPointer(el) {
+	const pos = (e) => {
+		let r = el.getBoundingClientRect();
+		return [e.clientX - r.left, e.clientY - r.top];
+	};
+	el.addEventListener('pointerdown', (e) => {
+		let [px, py] = pos(e);
+		let b = bubbleAt(px, py);
+		if (!b) return;
+		presses.set(e.pointerId, { b: b, t: performance.now() });
+		try { el.setPointerCapture(e.pointerId); } catch (err) {}
+	});
+	const end = (e) => {
+		let p = presses.get(e.pointerId);
+		if (!p) return;
+		presses.delete(e.pointerId);
+		if (performance.now() - p.t < HOLD_DELAY) p.b.poke();
+		else p.b.release();
+	};
+	el.addEventListener('pointerup', end);
+	el.addEventListener('pointercancel', end);
+	el.addEventListener('contextmenu', (e) => e.preventDefault()); // no long-press menu
+}
+
+// Called every frame: inflate dots that are being held, pop them when full
+function updatePresses() {
+	let now = performance.now();
+	for (let [id, p] of presses) {
+		let held = now - p.t;
+		if (held < HOLD_DELAY) continue;
+		let progress = (held - HOLD_DELAY) / INFLATE_MS;
+		p.b.hold(progress);
+		if (progress >= 1) {
+			p.b.burst();
+			presses.delete(id); // lifting the finger afterwards does nothing
+		}
+	}
+}
 
 function setup() {
-	createCanvas(windowWidth, windowHeight);
+	let cnv = createCanvas(windowWidth, windowHeight);
+	setupPointer(cnv.elt);
 	pixelDensity(min(2, displayDensity())); // cap for performance on high-DPI phones
 	rectMode(CENTER);
 	colorMode(HSB, 360, 100, 100, 100);
@@ -156,6 +214,7 @@ function buildGrid() {
 	centerX = width / 2;
 	centerY = height / 2;
 	let cellSize = min(width, height) * 0.85 / COLS;
+	gridCell = cellSize;
 	let marginX = (width - cellSize * COLS) / 2;
 	let marginMin = min(width, height) * 0.075; // same edge gap as the original square layout
 	let rows = max(1, floor((height - 2 * marginMin) / cellSize));
@@ -194,9 +253,12 @@ function windowResized() {
 function draw() {
 	background(255);
 	updateGravity();
+	updatePresses();
 	for (let b of bubbles) {
 		b.run();
 	}
+	for (let s of splashes) s.run();
+	splashes = splashes.filter((s) => !s.isDead);
 	if (showDebug) drawDebug();
 }
 
@@ -279,17 +341,37 @@ class Bubble {
 		this.homeX = x;
 		this.homeY = y;
 		this.anim = null;
+		// Size spring (1 = normal): used for inflating, deflating and regrowing after a pop
+		this.sz = 1;
+		this.szv = 0;
+		this.szTarget = 1;
+		// Jelly wobble: squash/stretch along a random axis, as a damped spring
+		this.wob = 0;
+		this.wobv = 0;
+		this.wobAng = 0;
+		this.holding = false;
+		this.popped = false;
+		this.regrowAt = 0;
 	}
 
 	show() {
+		if (this.popped || this.sz <= 0.01) return;
 		push();
 		translate(this.x, this.y);
+		if (this.holding) {
+			// tremble harder as it gets close to popping
+			let t = pow(max(0, this.sz - 1) / INFLATE_MAX, 3) * this.d * 0.08;
+			translate(random(-t, t), random(-t, t));
+		}
+		rotate(this.wobAng);
+		scale(this.sz * (1 + this.wob), this.sz * (1 - this.wob));
+		rotate(-this.wobAng);
 		noStroke();
 		fill(this.clr);
 		circle(0, 0, this.d);
 
-		// While flying to a new slot, show just the plain dot — no drips
-		if (this.anim) {
+		// While flying or inflating, show just the plain dot — no drips
+		if (this.anim || this.holding) {
 			pop();
 			return;
 		}
@@ -318,6 +400,78 @@ class Bubble {
 
 	addWisp() {
 		this.cage.push(new Wisp(0, 0, this.d * random(0.4, 0.9), this.d * random(0.75, 1.25)));
+	}
+
+	// ---- Touch reactions ----
+
+	// Quick tap: jelly wobble + spit out a ring of drips
+	poke() {
+		this.wobAng = random(TAU);
+		this.wobv += random(0.2, 0.28) * (random() < 0.5 ? -1 : 1);
+		this.szv += 0.06;
+		let n = int(random(4, 7));
+		let base = random(TAU);
+		for (let i = 0; i < n; i++) {
+			let ang = base + (i * TAU) / n + random(-0.3, 0.3);
+			this.cage.push(new Wisp(0, 0, this.d * random(0.3, 0.6), this.d * random(0.9, 1.4), ang, int(random(40, 80))));
+		}
+	}
+
+	// Long-press in progress: progress 0..1 inflates the dot up to (1 + INFLATE_MAX)×
+	hold(progress) {
+		if (!this.holding) this.cage = [];
+		this.holding = true;
+		let p = min(progress, 1);
+		this.szTarget = 1 + INFLATE_MAX * (1 - (1 - p) * (1 - p)); // ease-out
+	}
+
+	// Released before popping: deflate with a bouncy overshoot
+	release() {
+		this.holding = false;
+		this.szTarget = 1;
+		this.wobAng = random(TAU);
+		this.wobv += 0.12;
+	}
+
+	// Held long enough: burst into a splash of droplets, then regrow
+	burst() {
+		let r = (this.d * this.sz) / 2;
+		let n = int(random(18, 28));
+		for (let i = 0; i < n; i++) {
+			let ang = random(TAU);
+			let speed = this.d * random(0.08, 0.3);
+			splashes.push(new Splash(
+				this.x + cos(ang) * r * random(0.3, 1),
+				this.y + sin(ang) * r * random(0.3, 1),
+				cos(ang) * speed, sin(ang) * speed,
+				this.d * random(0.15, 0.5), this.clr, this.d
+			));
+		}
+		this.holding = false;
+		this.popped = true;
+		this.cage = [];
+		this.sz = 0;
+		this.szv = 0;
+		this.szTarget = 0;
+		this.wob = this.wobv = 0;
+		this.regrowAt = frameCount + 50;
+	}
+
+	updatePhysics() {
+		if (this.popped && frameCount >= this.regrowAt) {
+			this.popped = false;
+			this.szTarget = 1; // spring overshoot makes it "boing" back in
+		}
+		// stiffer and calmer while inflating, bouncier when springing back
+		let k = this.holding ? 0.2 : 0.12;
+		let damp = this.holding ? 0.6 : 0.8;
+		this.szv += (this.szTarget - this.sz) * k;
+		this.szv *= damp;
+		this.sz = max(0, this.sz + this.szv);
+
+		this.wobv = this.wobv * 0.88 - this.wob * 0.25;
+		this.wob = constrain(this.wob + this.wobv, -0.45, 0.45);
+		if (abs(this.wob) < 0.001 && abs(this.wobv) < 0.001) this.wob = this.wobv = 0;
 	}
 
 	// Jump straight to a position (used on resize; cancels any shuffle animation)
@@ -400,27 +554,71 @@ class Bubble {
 
 	run() {
 		this.update();
+		this.updatePhysics();
 		this.show();
 	}
 }
 
+// Free-flying droplet from a popped dot: flies out, falls with the tilt, shrinks away
+class Splash {
+	constructor(x, y, vx, vy, d, clr, scaleRef) {
+		this.x = x;
+		this.y = y;
+		this.vx = vx;
+		this.vy = vy;
+		this.d0 = d;
+		this.clr = clr;
+		this.g = scaleRef * 0.01; // gravity strength relative to dot size
+		this.age = 0;
+		this.life = int(random(40, 80));
+	}
+
+	run() {
+		this.age++;
+		// fall toward the tilt direction; straight down if there's no tilt
+		let gx = 0, gy = 1;
+		if (gravityStrength() > 0.05) {
+			gx = gravity.x;
+			gy = gravity.y;
+		}
+		this.vx = this.vx * 0.93 + gx * this.g;
+		this.vy = this.vy * 0.93 + gy * this.g;
+		this.x += this.vx;
+		this.y += this.vy;
+		let d = this.d0 * (1 - this.age / this.life);
+		noStroke();
+		fill(this.clr);
+		circle(this.x, this.y, d);
+	}
+
+	get isDead() {
+		return this.age >= this.life;
+	}
+}
+
 class Wisp {
-	constructor(x, y, d, r) {
+	constructor(x, y, d, r, ang, endTime) {
 		this.x = x;
 		this.y = y;
 		this.d = d;
 		this.timer = 0;
-		this.endTime = int(random(100, 300));
-		// Direction follows gravity: the stronger the tilt, the tighter the spread
-		// and the longer the drip. With no tilt it's fully random (original behaviour).
+		this.endTime = endTime || int(random(100, 300));
 		let s = gravityStrength();
-		if (s < 0.05) {
-			this.ang = random(TAU);
+		if (ang !== undefined) {
+			// explicit direction (poke burst): ignore tilt
+			this.ang = ang;
+			this.r = r;
 		} else {
-			let spread = lerp(PI / 2, 0.15, s);
-			this.ang = atan2(gravity.y, gravity.x) + random(-spread, spread);
+			// Direction follows gravity: the stronger the tilt, the tighter the spread
+			// and the longer the drip. With no tilt it's fully random (original behaviour).
+			if (s < 0.05) {
+				this.ang = random(TAU);
+			} else {
+				let spread = lerp(PI / 2, 0.15, s);
+				this.ang = atan2(gravity.y, gravity.x) + random(-spread, spread);
+			}
+			this.r = r * lerp(1, 1.6, s);
 		}
-		this.r = r * lerp(1, 1.6, s);
 		this.originX = this.x;
 		this.originY = this.y;
 		this.targetX = this.x + this.r * cos(this.ang);
