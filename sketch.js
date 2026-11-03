@@ -70,23 +70,58 @@ function keyPressed() {
 	if (key === 'd') showDebug = !showDebug;
 }
 
+const COLS = 8;
+let gridKey = '';
+
 function setup() {
-	createCanvas(900, 900);
+	createCanvas(windowWidth, windowHeight);
+	pixelDensity(min(2, displayDensity())); // cap for performance on high-DPI phones
 	rectMode(CENTER);
 	colorMode(HSB, 360, 100, 100, 100);
 	ctx = drawingContext;
+	buildGrid();
+}
+
+// 8 columns across; as many rows as fit vertically.
+// On landscape screens the cell size is also capped by height, so at least 8 rows fit.
+function buildGrid() {
 	centerX = width / 2;
 	centerY = height / 2;
-	let area = width * 0.85;
-	let cellCount = 8;
-	let cellSize = area / cellCount;
-	for (let i = 0; i < cellCount; i++) {
-		for (let j = 0; j < cellCount; j++) {
-			let x = cellSize * i + (cellSize / 2) + (width - area) / 2;
-			let y = cellSize * j + (cellSize / 2) + (height - area) / 2;
-			bubbles.push(new Bubble(x, y + cellSize * 0.2, cellSize * 0.4));
+	let cellSize = min(width, height) * 0.85 / COLS;
+	let marginX = (width - cellSize * COLS) / 2;
+	let marginMin = min(width, height) * 0.075; // same edge gap as the original square layout
+	let rows = max(1, floor((height - 2 * marginMin) / cellSize));
+	let gridH = cellSize * rows;
+	let offsetY = (height - gridH) / 2;
+
+	// Skip rebuilding if the grid is unchanged (e.g. mobile address bar showing/hiding
+	// only shifts the height slightly) — just re-center vertically.
+	let key = COLS + 'x' + rows + '@' + cellSize.toFixed(2);
+	let old = bubbles;
+	bubbles = [];
+	for (let j = 0; j < rows; j++) {
+		for (let i = 0; i < COLS; i++) {
+			let x = marginX + cellSize * i + cellSize / 2;
+			let y = offsetY + cellSize * j + cellSize / 2;
+			let idx = j * COLS + i;
+			let b;
+			if (key === gridKey && old[idx]) {
+				b = old[idx];
+				b.x = x;
+				b.y = y + cellSize * 0.2;
+			} else {
+				b = new Bubble(x, y + cellSize * 0.2, cellSize * 0.4);
+				if (old[idx]) b.clr = old[idx].clr; // keep colors stable across resizes
+			}
+			bubbles.push(b);
 		}
 	}
+	gridKey = key;
+}
+
+function windowResized() {
+	resizeCanvas(windowWidth, windowHeight);
+	buildGrid();
 }
 
 function draw() {
