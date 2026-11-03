@@ -52,19 +52,32 @@ window.addEventListener('devicemotion', (e) => {
 	}
 });
 
-// Every dot flies to a different grid slot along a slightly curved path.
-function shuffleBubbles() {
+// Trajectories to try on desktop with keys 1–5. Shaking uses SHAKE_MODE.
+const TRAJECTORIES = {
+	'1': 'straight', // straight line from start to end
+	'2': 'center',   // every dot passes through the canvas center
+	'3': 'arc',      // gentle random curve (the original shake motion)
+	'4': 'vortex',   // swirl around the center, one full turn
+	'5': 'explode',  // burst outward, then regroup
+};
+let SHAKE_MODE = 'explode';
+let lastMode = '';
+let lastModeFrame = -1000;
+
+// Every dot flies to a different grid slot.
+function shuffleBubbles(mode = SHAKE_MODE) {
 	let slots = bubbles.map((b) => ({ x: b.homeX, y: b.homeY }));
 	let perm = shuffle(slots.map((_, i) => i));
 	let reordered = new Array(bubbles.length);
 	for (let i = 0; i < bubbles.length; i++) {
 		let b = bubbles[i];
 		let s = slots[perm[i]];
-		b.moveTo(s.x, s.y);
+		b.moveTo(s.x, s.y, mode);
 		reordered[perm[i]] = b; // keep bubbles[idx] == the dot at grid slot idx
-		for (let k = 0; k < 2; k++) b.addWisp(); // splash a bit as they leave
 	}
 	bubbles = reordered;
+	lastMode = mode;
+	lastModeFrame = frameCount;
 }
 
 function mouseMoved() {
@@ -105,12 +118,20 @@ function drawDebug() {
 	textAlign(LEFT, CENTER);
 	let src = tiltActive ? 'tilt' : (mouseActive ? 'mouse' : 'random');
 	text(src + '  ' + nf(s, 1, 2), 40, 0);
+	// Name of the trajectory just used, fading out over ~2 s
+	let age = frameCount - lastModeFrame;
+	if (lastMode && age < 120) {
+		fill(0, 0, 30, map(age, 60, 120, 100, 0, true));
+		textSize(13);
+		text(lastMode, 40, 18);
+	}
 	pop();
 }
 
 function keyPressed() {
 	if (key === 'd') showDebug = !showDebug;
 	if (key === 's') shuffleBubbles(); // desktop stand-in for shaking
+	if (TRAJECTORIES[key]) shuffleBubbles(TRAJECTORIES[key]);
 }
 
 function easeInOutCubic(x) {
@@ -267,6 +288,11 @@ class Bubble {
 		fill(this.clr);
 		circle(0, 0, this.d);
 
+		// While flying to a new slot, show just the plain dot — no drips
+		if (this.anim) {
+			pop();
+			return;
+		}
 
 		for (let c of this.cage) {
 			c.run();
@@ -301,20 +327,49 @@ class Bubble {
 		this.anim = null;
 	}
 
-	// Animate to a new position
-	moveTo(x, y) {
-		let dx = x - this.x, dy = y - this.y;
+	// Animate to a new position along the given trajectory (see TRAJECTORIES)
+	moveTo(x, y, mode) {
+		let sx = this.x, sy = this.y;
+		let dx = x - sx, dy = y - sy;
 		let len = sqrt(dx * dx + dy * dy) || 1;
-		this.anim = {
-			sx: this.x, sy: this.y,
+		let a = {
+			mode: mode,
+			sx: sx, sy: sy, ex: x, ey: y,
 			t: -int(random(0, 15)),      // small random delay so they don't all move in lockstep
 			dur: int(random(45, 75)),
-			// perpendicular bend for a curved path, proportional to distance
-			px: -dy / len, py: dx / len,
-			bend: len * random(-0.3, 0.3),
 		};
+		if (mode === 'arc') {
+			// perpendicular bend, proportional to distance
+			a.px = -dy / len;
+			a.py = dx / len;
+			a.bend = len * random(-0.3, 0.3);
+		} else if (mode === 'center') {
+			// Quadratic Bézier whose midpoint (t=0.5) lands exactly on the canvas center
+			a.cx = 2 * centerX - (sx + x) / 2;
+			a.cy = 2 * centerY - (sy + y) / 2;
+			a.dur = int(random(60, 90));
+		} else if (mode === 'vortex') {
+			// Polar interpolation around the center, plus one full turn
+			a.a0 = atan2(sy - centerY, sx - centerX);
+			a.a1 = atan2(y - centerY, x - centerX);
+			while (a.a1 < a.a0) a.a1 += TAU;
+			a.a1 += TAU;
+			a.r0 = dist(sx, sy, centerX, centerY);
+			a.r1 = dist(x, y, centerX, centerY);
+			a.dur = int(random(80, 110));
+		} else if (mode === 'explode') {
+			// Bézier control point pushed far outward from the center: burst out, then regroup
+			let ox = sx - centerX, oy = sy - centerY;
+			let olen = sqrt(ox * ox + oy * oy) || 1;
+			let push = max(width, height) * random(0.35, 0.6);
+			a.cx = (sx + x) / 2 + (ox / olen) * push;
+			a.cy = (sy + y) / 2 + (oy / olen) * push;
+			a.dur = int(random(60, 90));
+		}
+		this.anim = a;
 		this.homeX = x;
 		this.homeY = y;
+		this.cage = []; // drop any drips in progress
 	}
 
 	update() {
@@ -323,9 +378,23 @@ class Bubble {
 		a.t++;
 		let n = constrain(a.t / a.dur, 0, 1);
 		let e = easeInOutCubic(n);
-		let arc = sin(PI * n) * a.bend;
-		this.x = lerp(a.sx, this.homeX, e) + a.px * arc;
-		this.y = lerp(a.sy, this.homeY, e) + a.py * arc;
+		if (a.mode === 'arc') {
+			let arc = sin(PI * n) * a.bend;
+			this.x = lerp(a.sx, a.ex, e) + a.px * arc;
+			this.y = lerp(a.sy, a.ey, e) + a.py * arc;
+		} else if (a.mode === 'center' || a.mode === 'explode') {
+			let u = 1 - e;
+			this.x = u * u * a.sx + 2 * u * e * a.cx + e * e * a.ex;
+			this.y = u * u * a.sy + 2 * u * e * a.cy + e * e * a.ey;
+		} else if (a.mode === 'vortex') {
+			let ang = lerp(a.a0, a.a1, e);
+			let r = lerp(a.r0, a.r1, e);
+			this.x = centerX + r * cos(ang);
+			this.y = centerY + r * sin(ang);
+		} else { // 'straight'
+			this.x = lerp(a.sx, a.ex, e);
+			this.y = lerp(a.sy, a.ey, e);
+		}
 		if (n >= 1) this.setHome(this.homeX, this.homeY); // snap exactly into the slot
 	}
 
