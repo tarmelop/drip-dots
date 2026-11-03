@@ -138,7 +138,7 @@ function easeInOutCubic(x) {
 	return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
 }
 
-const COLS = 8;
+const COLS = 4;
 let gridKey = '';
 let gridCell = 0;
 
@@ -208,8 +208,8 @@ function setup() {
 	buildGrid();
 }
 
-// 8 columns across; as many rows as fit vertically.
-// On landscape screens the cell size is also capped by height, so at least 8 rows fit.
+// COLS columns across; as many rows as fit vertically.
+// On landscape screens the cell size is also capped by height, so at least COLS rows fit.
 function buildGrid() {
 	centerX = width / 2;
 	centerY = height / 2;
