@@ -25,6 +25,48 @@ window.addEventListener('deviceorientation', (e) => {
 	gravityTarget.y = Math.sin(b * Math.PI / 180);
 });
 
+// ---- Shake detection ----
+const SHAKE_THRESHOLD = 18;   // m/s² of linear acceleration (gravity excluded)
+const SHAKE_COOLDOWN = 1200;  // ms between shuffles
+let lastShake = 0;
+let lastAccel = null;
+
+window.addEventListener('devicemotion', (e) => {
+	let mag = 0;
+	let a = e.acceleration;
+	if (a && a.x != null) {
+		mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+	} else if (e.accelerationIncludingGravity && e.accelerationIncludingGravity.x != null) {
+		// Fallback: sudden change in acceleration-including-gravity
+		let g = e.accelerationIncludingGravity;
+		if (lastAccel) {
+			let dx = g.x - lastAccel.x, dy = g.y - lastAccel.y, dz = g.z - lastAccel.z;
+			mag = Math.sqrt(dx * dx + dy * dy + dz * dz);
+		}
+		lastAccel = { x: g.x, y: g.y, z: g.z };
+	}
+	let now = Date.now();
+	if (mag > SHAKE_THRESHOLD && now - lastShake > SHAKE_COOLDOWN) {
+		lastShake = now;
+		shuffleBubbles();
+	}
+});
+
+// Every dot flies to a different grid slot along a slightly curved path.
+function shuffleBubbles() {
+	let slots = bubbles.map((b) => ({ x: b.homeX, y: b.homeY }));
+	let perm = shuffle(slots.map((_, i) => i));
+	let reordered = new Array(bubbles.length);
+	for (let i = 0; i < bubbles.length; i++) {
+		let b = bubbles[i];
+		let s = slots[perm[i]];
+		b.moveTo(s.x, s.y);
+		reordered[perm[i]] = b; // keep bubbles[idx] == the dot at grid slot idx
+		for (let k = 0; k < 2; k++) b.addWisp(); // splash a bit as they leave
+	}
+	bubbles = reordered;
+}
+
 function mouseMoved() {
 	if (mouseX >= 0 && mouseX <= width && mouseY >= 0 && mouseY <= height) {
 		mouseActive = true;
@@ -68,6 +110,11 @@ function drawDebug() {
 
 function keyPressed() {
 	if (key === 'd') showDebug = !showDebug;
+	if (key === 's') shuffleBubbles(); // desktop stand-in for shaking
+}
+
+function easeInOutCubic(x) {
+	return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
 }
 
 const COLS = 8;
@@ -107,8 +154,7 @@ function buildGrid() {
 			let b;
 			if (key === gridKey && old[idx]) {
 				b = old[idx];
-				b.x = x;
-				b.y = y + cellSize * 0.2;
+				b.setHome(x, y + cellSize * 0.2);
 			} else {
 				b = new Bubble(x, y + cellSize * 0.2, cellSize * 0.4);
 				if (old[idx]) b.clr = old[idx].clr; // keep colors stable across resizes
@@ -209,6 +255,9 @@ class Bubble {
 		this.cage = [];
 		this.dst = this.d / 2;
 		this.clr = random(colors);
+		this.homeX = x;
+		this.homeY = y;
+		this.anim = null;
 	}
 
 	show() {
@@ -245,7 +294,43 @@ class Bubble {
 		this.cage.push(new Wisp(0, 0, this.d * random(0.4, 0.9), this.d * random(0.75, 1.25)));
 	}
 
+	// Jump straight to a position (used on resize; cancels any shuffle animation)
+	setHome(x, y) {
+		this.x = this.homeX = x;
+		this.y = this.homeY = y;
+		this.anim = null;
+	}
+
+	// Animate to a new position
+	moveTo(x, y) {
+		let dx = x - this.x, dy = y - this.y;
+		let len = sqrt(dx * dx + dy * dy) || 1;
+		this.anim = {
+			sx: this.x, sy: this.y,
+			t: -int(random(0, 15)),      // small random delay so they don't all move in lockstep
+			dur: int(random(45, 75)),
+			// perpendicular bend for a curved path, proportional to distance
+			px: -dy / len, py: dx / len,
+			bend: len * random(-0.3, 0.3),
+		};
+		this.homeX = x;
+		this.homeY = y;
+	}
+
+	update() {
+		let a = this.anim;
+		if (!a) return;
+		a.t++;
+		let n = constrain(a.t / a.dur, 0, 1);
+		let e = easeInOutCubic(n);
+		let arc = sin(PI * n) * a.bend;
+		this.x = lerp(a.sx, this.homeX, e) + a.px * arc;
+		this.y = lerp(a.sy, this.homeY, e) + a.py * arc;
+		if (n >= 1) this.setHome(this.homeX, this.homeY); // snap exactly into the slot
+	}
+
 	run() {
+		this.update();
 		this.show();
 	}
 }
