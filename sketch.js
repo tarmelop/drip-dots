@@ -159,6 +159,45 @@ function bubbleAt(px, py) {
 	return bestD < gridCell * 0.55 ? best : null; // generous hit area for fingers
 }
 
+// ---- Zoom & pan ----
+// The scene is drawn as: screen = world * view.s + (view.x, view.y)
+const ZOOM_MAX = 4;
+let view = { s: 1, x: 0, y: 0 };
+let pointers = new Map(); // pointerId → { x, y } screen position of every finger down
+let pinch = null;         // active two-finger gesture
+let pan = null;           // active one-finger drag on empty space (only when zoomed in)
+
+function toWorld(px, py) {
+	return [(px - view.x) / view.s, (py - view.y) / view.s];
+}
+
+// Keep the zoomed scene covering the whole screen (no empty edges)
+function clampView() {
+	view.s = constrain(view.s, 1, ZOOM_MAX);
+	view.x = constrain(view.x, width - width * view.s, 0);
+	view.y = constrain(view.y, height - height * view.s, 0);
+}
+
+// Zoom to scale s, keeping the world point under screen point (px, py) fixed
+function zoomAt(px, py, s) {
+	let [wx, wy] = toWorld(px, py);
+	view.s = constrain(s, 1, ZOOM_MAX);
+	view.x = px - wx * view.s;
+	view.y = py - wy * view.s;
+	clampView();
+}
+
+// Desktop: scroll wheel / trackpad pinch zooms around the cursor
+function mouseWheel(e) {
+	zoomAt(mouseX, mouseY, view.s * Math.exp(-e.delta * 0.0015));
+	return false;
+}
+
+function twoFingers() {
+	let [a, b] = [...pointers.values()];
+	return { mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, d: max(1, dist(a.x, a.y, b.x, b.y)) };
+}
+
 function setupPointer(el) {
 	const pos = (e) => {
 		let r = el.getBoundingClientRect();
@@ -166,12 +205,50 @@ function setupPointer(el) {
 	};
 	el.addEventListener('pointerdown', (e) => {
 		let [px, py] = pos(e);
-		let b = bubbleAt(px, py);
-		if (!b) return;
-		presses.set(e.pointerId, { b: b, t: performance.now() });
+		pointers.set(e.pointerId, { x: px, y: py });
 		try { el.setPointerCapture(e.pointerId); } catch (err) {}
+
+		if (pointers.size === 2) {
+			// Second finger: it's a pinch. Cancel any poke/hold without triggering it.
+			for (let p of presses.values()) if (p.b.holding) p.b.release();
+			presses.clear();
+			pan = null;
+			let f = twoFingers();
+			let [wx, wy] = toWorld(f.mx, f.my);
+			pinch = { d0: f.d, s0: view.s, wx: wx, wy: wy };
+			return;
+		}
+		if (pointers.size > 2 || pinch) return;
+
+		let [wx, wy] = toWorld(px, py);
+		let b = bubbleAt(wx, wy);
+		if (b) {
+			presses.set(e.pointerId, { b: b, t: performance.now() });
+		} else if (view.s > 1) {
+			pan = { id: e.pointerId, sx: px, sy: py, vx: view.x, vy: view.y };
+		}
+	});
+	el.addEventListener('pointermove', (e) => {
+		if (!pointers.has(e.pointerId)) return;
+		let [px, py] = pos(e);
+		pointers.set(e.pointerId, { x: px, y: py });
+		if (pinch && pointers.size >= 2) {
+			// Scale by finger distance; the world point under the fingers follows their midpoint
+			let f = twoFingers();
+			view.s = constrain(pinch.s0 * f.d / pinch.d0, 1, ZOOM_MAX);
+			view.x = f.mx - pinch.wx * view.s;
+			view.y = f.my - pinch.wy * view.s;
+			clampView();
+		} else if (pan && pan.id === e.pointerId) {
+			view.x = pan.vx + (px - pan.sx);
+			view.y = pan.vy + (py - pan.sy);
+			clampView();
+		}
 	});
 	const end = (e) => {
+		pointers.delete(e.pointerId);
+		if (pinch && pointers.size < 2) pinch = null; // the remaining finger does nothing
+		if (pan && pan.id === e.pointerId) pan = null;
 		let p = presses.get(e.pointerId);
 		if (!p) return;
 		presses.delete(e.pointerId);
@@ -248,18 +325,23 @@ function buildGrid() {
 function windowResized() {
 	resizeCanvas(windowWidth, windowHeight);
 	buildGrid();
+	clampView();
 }
 
 function draw() {
 	background(255);
 	updateGravity();
 	updatePresses();
+	push();
+	translate(view.x, view.y);
+	scale(view.s);
 	for (let b of bubbles) {
 		b.run();
 	}
 	for (let s of splashes) s.run();
+	pop();
 	splashes = splashes.filter((s) => !s.isDead);
-	if (showDebug) drawDebug();
+	if (showDebug) drawDebug(); // stays fixed on screen, not zoomed
 }
 
 
